@@ -1,0 +1,10 @@
+# نسخ مثبّتة لتجنب كسر التوافق (اختُبرت منطقياً؛ إن تغيّر شيء عند النشر راجع README)
+streamlit==1.41.1
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.13.1
+scikit-learn==1.5.2
+openpyxl==3.1.5
+# mediapipe 0.10.14 يضمّ نموذج تقدير الوضعية داخل الحزمة (واجهة mp.solutions)،
+# ويجلب معه opencv-contrib-python (مكتبة cv2) تلقائياً.
+mediapipe==0.10.14

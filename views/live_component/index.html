@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#f6f7f9; --fg:#1b1f24; --muted:#5b6570; --card:#fff; --line:#d9dee5; --acc:#1e66d0; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14171a; --fg:#eceff3; --muted:#9aa4af; --card:#1d2227; --line:#323a42; } }
+  html,body { margin:0; background:var(--bg); color:var(--fg); font-family: Tajawal, Tahoma, Arial, sans-serif; }
+  #app { padding:8px; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:8px; }
+  button, select { font: inherit; padding:10px 16px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  button.primary { background:var(--acc); color:#fff; border-color:var(--acc); font-weight:700; }
+  button:disabled { opacity:.5; }
+  #status { color:var(--muted); font-size:14px; flex:1 1 220px; }
+  .stage { display:flex; flex-wrap:wrap; gap:8px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  #cam { position:relative; flex:2 1 420px; min-width:280px; }
+  #cam canvas { width:100%; display:block; }
+  #ref { flex:1 1 220px; min-width:200px; text-align:center; padding:6px; }
+  #ref canvas { width:100%; max-width:340px; }
+  #msg { font-size:22px; font-weight:700; padding:6px 10px; min-height:34px; }
+  #angles { padding:6px 10px; font-size:15px; line-height:1.9; }
+  video { display:none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="bar">
+    <button id="btnCam" class="primary">📷 تشغيل الكاميرا</button>
+    <button id="btnStart" disabled>▶ ابدأ الجلسة</button>
+    <button id="btnStop" disabled>■ إيقاف</button>
+    <select id="facing" title="الكاميرا"><option value="user">الكاميرا الأمامية</option><option value="environment">الكاميرا الخلفية</option></select>
+    <button id="btnFs">⛶ ملء الشاشة</button>
+    <div id="status">اضغط «تشغيل الكاميرا» ثم اسمح للمتصفح باستخدامها.</div>
+  </div>
+  <div class="stage" id="stage">
+    <div id="cam" class="panel">
+      <div id="msg">—</div>
+      <canvas id="view" width="640" height="480"></canvas>
+      <div id="angles"></div>
+    </div>
+    <div id="ref" class="panel">
+      <div style="font-weight:700;margin:4px 0">الوضع الصحيح</div>
+      <canvas id="refc" width="300" height="420"></canvas>
+      <div style="color:var(--muted);font-size:13px">الأرقام الخضراء = الزوايا المستهدفة</div>
+    </div>
+  </div>
+  <video id="vid" playsinline muted autoplay></video>
+</div>
+<script src="engine.js"></script>
+<script>
+// ---------------------------------------------------------------- بروتوكول Streamlit
+function send(type, data) { window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data || {}), "*"); }
+let ARGS = null, runId = 0;
+window.addEventListener("message", e => {
+  if (e.data && e.data.type === "streamlit:render") { ARGS = e.data.args; if (ARGS && ARGS.ref_png) loadRef(); }
+});
+send("streamlit:componentReady", { apiVersion: 1 });
+send("streamlit:setFrameHeight", { height: 820 });
+
+// ---------------------------------------------------------------- عناصر الواجهة
+const $ = id => document.getElementById(id);
+const vid = $("vid"), view = $("view"), ctx = view.getContext("2d"), refc = $("refc"), rctx = refc.getContext("2d");
+ctx.direction = "ltr";
+const status = t => { $("status").textContent = t; };
+let refImg = null, engine = null, landmarker = null, stream = null, lastVideoTime = -1, loopOn = false, audioCtx = null;
+let lastXY = null;
+const SKELETON = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28]];
+const COL = { ok: "#2ea043", low: "#f08c1e", high: "#dc2828" };
+
+function loadRef() {
+  const im = new Image(); im.onload = () => { refImg = im; drawRef(); }; im.src = "data:image/png;base64," + ARGS.ref_png;
+}
+function drawRef() {
+  rctx.clearRect(0, 0, refc.width, refc.height);
+  if (refImg) rctx.drawImage(refImg, 0, 0, refc.width, refc.height);
+}
+
+// ---------------------------------------------------------------- الكاميرا والنموذج
+async function startCamera() {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+      throw new Error("المتصفح لا يدعم الكاميرا هنا (يلزم اتصال HTTPS أو localhost).");
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    status("جارٍ فتح الكاميرا…");
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: $("facing").value, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }, audio: false });
+    vid.srcObject = stream; await vid.play();
+    view.width = vid.videoWidth || 640; view.height = vid.videoHeight || 480; ctx.direction = "ltr";
+    $("btnCam").textContent = "🔄 إعادة تشغيل الكاميرا";
+    status("الكاميرا تعمل. جارٍ تحميل نموذج تقدير الوضعية…");
+    if (!loopOn) { loopOn = true; requestAnimationFrame(loop); }
+    await loadModel();
+  } catch (e) {
+    const name = e && e.name ? e.name : "";
+    const hint = name === "NotAllowedError" ? "رُفض الإذن: اسمح للموقع باستخدام الكاميرا من إعدادات المتصفح (أيقونة القفل بجانب العنوان) ثم أعد المحاولة."
+      : name === "NotFoundError" ? "لا توجد كاميرا متاحة في هذا الجهاز."
+      : name === "NotReadableError" ? "الكاميرا مستخدمة من تطبيق آخر؛ أغلقه ثم أعد المحاولة."
+      : (e && e.message) || String(e);
+    status("تعذر تشغيل الكاميرا — " + hint);
+  }
+}
+
+async function loadModel() {
+  if (landmarker) { $("btnStart").disabled = false; status("جاهز. ثبّت الكاميرا ثم اضغط «ابدأ الجلسة»."); return; }
+  try {
+    const mod = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
+    const files = await mod.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opts = d => ({ baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task", delegate: d },
+                         runningMode: "VIDEO", numPoses: 1 });
+    try { landmarker = await mod.PoseLandmarker.createFromOptions(files, opts("GPU")); }
+    catch (e) { landmarker = await mod.PoseLandmarker.createFromOptions(files, opts("CPU")); }
+    $("btnStart").disabled = false;
+    status("جاهز. ثبّت الكاميرا بحيث يظهر اللاعب كاملاً ثم اضغط «ابدأ الجلسة».");
+  } catch (e) {
+    status("تعذر تحميل نموذج تقدير الوضعية (يلزم اتصال بالإنترنت لأول مرة): " + ((e && e.message) || e));
+  }
+}
+
+function detect() {
+  if (!landmarker || vid.currentTime === lastVideoTime || vid.readyState < 2) return undefined;
+  lastVideoTime = vid.currentTime;
+  const res = landmarker.detectForVideo(vid, performance.now());
+  if (!res.landmarks || !res.landmarks.length) return null;
+  const lm = res.landmarks[0], w = view.width, h = view.height;
+  const vis = [11, 12, 23, 24].reduce((a, i) => a + (lm[i].visibility == null ? 1 : lm[i].visibility), 0) / 4;
+  if (vis < 0.4) return null;
+  return lm.map(p => [p.x * w, p.y * h]);
+}
+
+// ---------------------------------------------------------------- الحلقة
+function loop() {
+  requestAnimationFrame(loop);
+  if (!stream) return;
+  const t = performance.now() / 1000;
+  ctx.drawImage(vid, 0, 0, view.width, view.height);
+  const xy = detect();
+  if (xy !== undefined) lastXY = xy;
+  let state = { phase: "idle", stim: null, status: {}, nDone: 0, nTrials: 0, message: "" };
+  if (engine && !engine.done || (engine && engine.done && !engine.sent)) {
+    if (xy !== undefined) state = engine.update(t, xy); else state = engine.state();
+    if (engine.done && !engine.sent) finishSession();
+  } else if (engine) state = engine.state();
+  draw(lastXY, state);
+  $("msg").textContent = state.message || (landmarker ? "الكاميرا جاهزة" : "—");
+  if (state.status) {
+    const rows = Object.values(state.status).map(s => (s.status === "ok" ? "🟢" : s.status === "low" ? "🟠 أقل من المدى" : "🔴 أعلى من المدى") + " " + s.label + ": " + Math.round(s.value));
+    $("angles").innerHTML = rows.join("<br>");
+  }
+}
+
+function drawArrow(c, cx, cy, d, len) {
+  const n = Math.hypot(d[0], d[1]), ux = d[0] / n, uy = d[1] / n, a = [cx - ux * len, cy - uy * len], b = [cx + ux * len, cy + uy * len];
+  c.strokeStyle = "#fff"; c.fillStyle = "#fff"; c.lineWidth = 10; c.lineCap = "round";
+  c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(b[0], b[1]); c.stroke();
+  const ang = Math.atan2(uy, ux), hl = len * 0.6;
+  c.beginPath(); c.moveTo(b[0], b[1]);
+  c.lineTo(b[0] - hl * Math.cos(ang - 0.5), b[1] - hl * Math.sin(ang - 0.5));
+  c.lineTo(b[0] - hl * Math.cos(ang + 0.5), b[1] - hl * Math.sin(ang + 0.5)); c.closePath(); c.fill();
+}
+
+function drawSkeleton(c, xy, status, w) {
+  c.lineWidth = Math.max(3, w / 160); c.strokeStyle = "#00dc00"; c.lineCap = "round";
+  for (const [a, b] of SKELETON) { c.beginPath(); c.moveTo(xy[a][0], xy[a][1]); c.lineTo(xy[b][0], xy[b][1]); c.stroke(); }
+  c.fillStyle = "#ff7800";
+  for (const j of [11,12,13,14,15,16,23,24,25,26,27,28]) { c.beginPath(); c.arc(xy[j][0], xy[j][1], Math.max(4, w / 130), 0, 7); c.fill(); }
+}
+function jointIndex(key, dom, xy) {
+  const L = BacEngine.LM, s = dom === "right" ? "r" : "l";
+  if (key === "elbow") return L[s + "_el"]; if (key === "shoulder") return L[s + "_sh"];
+  if (key === "knee") { const a = ["l", "r"].map(x => BacEngine.angleDeg(xy[L[x + "_hip"]], xy[L[x + "_kn"]], xy[L[x + "_an"]])); return a[0] <= a[1] ? L.l_kn : L.r_kn; }
+  return L[s + "_sh"];
+}
+function annotate(c, xy, status, dom, w) {
+  c.font = "bold " + Math.round(w / 28) + "px sans-serif";
+  for (const [key, s] of Object.entries(status || {})) {
+    const j = jointIndex(key, dom, xy), p = xy[j];
+    c.fillStyle = COL[s.status]; c.beginPath(); c.arc(p[0], p[1], Math.max(7, w / 70), 0, 7); c.fill();
+    c.lineWidth = 4; c.strokeStyle = "#fff"; c.strokeText(String(Math.round(s.value)), p[0] + 10, p[1] - 10);
+    c.fillStyle = COL[s.status]; c.fillText(String(Math.round(s.value)), p[0] + 10, p[1] - 10);
+  }
+}
+
+function draw(xy, st) {
+  const w = view.width, h = view.height, dom = (ARGS && ARGS.dominant) || "right";
+  if (xy) { drawSkeleton(ctx, xy, st.status, w); annotate(ctx, xy, st.status, dom, w); }
+  const size = Math.round(w * 0.26);
+  ctx.save();
+  if (st.stim && (st.phase === "stimulus" || st.phase === "decoy" || st.phase === "cue")) {
+    const s = st.stim;
+    ctx.fillStyle = s.bg; ctx.fillRect(10, 10, size, size);
+    ctx.strokeStyle = s.bg; ctx.lineWidth = 12; ctx.strokeRect(0, 0, w, h);
+    if (s.arrow) drawArrow(ctx, 10 + size / 2, 10 + size / 2, s.arrow, size * 0.32);
+    if (s.digit != null) { ctx.fillStyle = "#fff"; ctx.font = "bold " + Math.round(size * 0.4) + "px sans-serif"; ctx.fillText(String(s.digit), 10 + size * 0.68, 10 + size * 0.92); }
+    if (s.cue) { ctx.fillStyle = "#111"; ctx.font = "bold " + Math.round(size * 0.22) + "px Tahoma"; ctx.direction = "rtl"; ctx.textAlign = "center"; ctx.fillText("تهيّأ", 10 + size / 2, 10 + size / 2 + 8); ctx.direction = "ltr"; ctx.textAlign = "left"; }
+    if (s.sound && !s.played) { s.played = true; beep(); }
+  } else if (engine && !engine.done) {
+    ctx.fillStyle = "rgba(90,90,90,.85)"; ctx.fillRect(10, 10, size, size);
+  }
+  ctx.restore();
+  if (st.lastRt != null) {
+    ctx.font = "bold " + Math.round(w / 14) + "px sans-serif"; ctx.textAlign = "right"; ctx.lineWidth = 6; ctx.strokeStyle = "#fff";
+    const txt = Math.round(st.lastRt * 1000) + " ms"; ctx.strokeText(txt, w - 12, 50); ctx.fillStyle = "#111"; ctx.fillText(txt, w - 12, 50); ctx.textAlign = "left";
+  }
+  if (engine) { ctx.font = "bold 24px sans-serif"; ctx.fillStyle = "#fff"; ctx.fillText(st.nDone + "/" + st.nTrials, 14, h - 14); }
+}
+
+function beep() {
+  try { audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain(); o.frequency.value = 880; g.gain.value = 0.4;
+    o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime + 0.18); } catch (e) {}
+}
+
+// ---------------------------------------------------------------- الجلسة
+function makeCard(xy, ref, dom, status) {
+  const c = document.createElement("canvas"); c.width = 660; c.height = 420; const g = c.getContext("2d");
+  g.fillStyle = "#f5f5f5"; g.fillRect(0, 0, 360, 420);
+  const xs = xy.map(p => p[0]), ys = xy.map(p => p[1]);
+  const lo = [Math.min(...xs), Math.min(...ys)], hi = [Math.max(...xs), Math.max(...ys)];
+  const span = Math.max(hi[0] - lo[0], hi[1] - lo[1], 1), sc = 0.8 * 360 / span;
+  const sh = xy.map(p => [(p[0] - (lo[0] + hi[0]) / 2) * sc + 180, (p[1] - (lo[1] + hi[1]) / 2) * sc + 210]);
+  drawSkeleton(g, sh, status, 360); annotate(g, sh, status, dom, 360);
+  if (refImg) g.drawImage(refImg, 360, 0, 300, 420);
+  return c.toDataURL("image/jpeg", 0.8);
+}
+
+function startSession() {
+  if (!ARGS) { status("لم تصل إعدادات التمرين بعد، أعد المحاولة."); return; }
+  engine = new BacEngine.LiveEngine(JSON.parse(JSON.stringify(ARGS.cfg)));
+  engine.sent = false; engine.start(performance.now() / 1000);
+  $("btnStart").disabled = true; $("btnStop").disabled = false; status("الجلسة جارية…");
+}
+function finishSession() {
+  engine.sent = true; $("btnStart").disabled = false; $("btnStop").disabled = true;
+  const dom = ARGS.cfg.dominant, cards = [];
+  const rows = engine.trials.map(r => { const o = Object.assign({}, r); if (o._xy) {
+    if (cards.length < 6) { const st = BacEngine.postureStatus(BacEngine.postureAt(o._xy, dom), ARGS.cfg.posture_ref || {}, true);
+      cards.push({ idx: o.idx, img: makeCard(o._xy, refImg, dom, st) }); }
+    delete o._xy; } return o; });
+  runId += 1;
+  send("streamlit:setComponentValue", { dataType: "json", value: { run: (ARGS.nonce || "") + ":" + Date.now(), trials: rows, cards,
+    detected: engine.total ? engine.detected / engine.total : 0 } });
+  status("انتهت الجلسة — راجع النتائج واحفظها من الأسفل.");
+}
+
+$("btnCam").onclick = startCamera;
+$("btnStart").onclick = startSession;
+$("btnStop").onclick = () => { if (engine) engine.stop(); };
+$("btnFs").onclick = () => { const el = $("stage"); (el.requestFullscreen || el.webkitRequestFullscreen || (() => {})).call(el); };
+$("facing").onchange = () => { if (stream) startCamera(); };
+</script>
+</body>
+</html>
